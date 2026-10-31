@@ -11,7 +11,10 @@ import android.media.tv.TvContract;
 import android.net.Uri;
 import android.util.Log;
 
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -27,9 +30,9 @@ import java.util.TreeMap;
  * resume off the main thread. Needs READ_TV_LISTINGS (build-and-install grants it); without it the query
  * throws and the row stays hidden.
  *
- * Only local posters are loaded (content://, android.resource://, file://). Most apps publish https://
- * poster URLs on their own CDNs; this app has no INTERNET permission, so those rows get a text card instead
- * and Home never makes a network request.
+ * Posters load from local URIs (content://, android.resource://, file://) and, in this private build, from
+ * https:// too: most apps (RaiPlay, Netflix, Prime Video) publish only web posters. A row whose poster fails
+ * keeps the app's banner.
  */
 final class ContinueWatching {
     static final String TAG = "TvHomeContinue";
@@ -40,6 +43,8 @@ final class ContinueWatching {
     static final int MAX_ITEMS = 10;
     /** Poster decode width; a card is 160dp wide, 2x on this box. */
     private static final int POSTER_PX = 360;
+    /** Largest web poster accepted, before decoding. */
+    private static final int MAX_POSTER_BYTES = 4 * 1024 * 1024;
 
     static final class Item {
         final String pkg;
@@ -47,7 +52,7 @@ final class ContinueWatching {
         final String subtitle;
         final String intentUri;
         final float progress;      // 0..1, or -1 when the app gives no position
-        final String posterUri;    // local posters only; null: the app's banner
+        final String posterUri;    // local or web poster; null: the app's banner
         Bitmap poster;             // filled in by loadPoster, off the main thread
 
         Item(String pkg, String title, String subtitle, String intentUri, float progress, String posterUri) {
@@ -99,7 +104,7 @@ final class ContinueWatching {
                 String poster = str(c, TvContract.WatchNextPrograms.COLUMN_POSTER_ART_URI);
                 if (poster == null) poster = str(c, TvContract.WatchNextPrograms.COLUMN_THUMBNAIL_URI);
                 Item item = new Item(pkg, title, subtitle(c), str(c, TvContract.WatchNextPrograms.COLUMN_INTENT_URI),
-                        progress, isLocal(poster) ? poster : null);
+                        progress, isFetchable(poster) ? poster : null);
                 item.poster = cached(item.posterUri);
                 order.add(new long[]{engaged, items.size()});
                 items.add(item);
@@ -141,10 +146,37 @@ final class ContinueWatching {
         }
     };
 
-    private static boolean isLocal(String uri) {
+    private static boolean isFetchable(String uri) {
         if (uri == null) return false;
         String scheme = Uri.parse(uri).getScheme();
-        return "content".equals(scheme) || "android.resource".equals(scheme) || "file".equals(scheme);
+        return "content".equals(scheme) || "android.resource".equals(scheme) || "file".equals(scheme)
+                || "https".equals(scheme) || "http".equals(scheme);
+    }
+
+    /** A web poster's bytes, or null. Capped so a broken server cannot fill the TV's 1 GB of RAM. */
+    private static byte[] download(String uri) {
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new URL(uri).openConnection();
+            c.setConnectTimeout(5000);
+            c.setReadTimeout(10000);
+            c.setInstanceFollowRedirects(true);
+            if (c.getResponseCode() != HttpURLConnection.HTTP_OK) return null;
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[16384];
+            try (InputStream in = c.getInputStream()) {
+                for (int n; (n = in.read(buf)) > 0; ) {
+                    out.write(buf, 0, n);
+                    if (out.size() > MAX_POSTER_BYTES) return null;
+                }
+            }
+            return out.toByteArray();
+        } catch (Exception e) {
+            Log.w(TAG, "poster not downloaded: " + e);
+            return null;
+        } finally {
+            if (c != null) c.disconnect();
+        }
     }
 
     private static Bitmap cached(String uri) {
@@ -168,6 +200,24 @@ final class ContinueWatching {
 
     private static Bitmap decode(ContentResolver cr, String uri) {
         Uri u = Uri.parse(uri);
+        String scheme = u.getScheme();
+        if ("https".equals(scheme) || "http".equals(scheme)) {
+            byte[] data = download(uri);
+            if (data == null) return null;
+            try {
+                BitmapFactory.Options bounds = new BitmapFactory.Options();
+                bounds.inJustDecodeBounds = true;
+                BitmapFactory.decodeByteArray(data, 0, data.length, bounds);
+                BitmapFactory.Options opts = new BitmapFactory.Options();
+                opts.inSampleSize = 1;
+                while (bounds.outWidth / (opts.inSampleSize * 2) >= POSTER_PX) opts.inSampleSize *= 2;
+                opts.inPreferredConfig = Bitmap.Config.RGB_565;
+                return BitmapFactory.decodeByteArray(data, 0, data.length, opts);
+            } catch (OutOfMemoryError e) {
+                Log.w(TAG, "poster not decoded: " + e);
+                return null;
+            }
+        }
         try {
             BitmapFactory.Options bounds = new BitmapFactory.Options();
             bounds.inJustDecodeBounds = true;
